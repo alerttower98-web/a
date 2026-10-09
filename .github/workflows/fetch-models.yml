@@ -39,8 +39,9 @@ jobs:
           python-version: "3.11"
       - name: Install the official packages (CPU)
         run: |
-          pip install --index-url https://download.pytorch.org/whl/cpu torch torchaudio
-          pip install audiobox_aesthetics muq librosa==0.11.0 hydra-core omegaconf safetensors einops easydict transformers soundfile
+          pip install --index-url https://download.pytorch.org/whl/cpu torch==2.5.1 torchaudio==2.5.1
+          pip install "transformers==4.48.3" audiobox_aesthetics muq librosa==0.11.0 hydra-core omegaconf safetensors einops easydict soundfile
+          python -c "import torch, torchaudio, transformers; print(torch.__version__, torchaudio.__version__, transformers.__version__)"
           git clone --depth 1 https://github.com/ASLP-lab/SongEval
       - name: Make test audio + run official Audiobox Aesthetics and SongEval
         run: |
