@@ -1,0 +1,111 @@
+name: fetch-models
+# 1) Copies the official Meta Audiobox Aesthetics weights and the MuQ weights used by SongEval from Hugging Face
+#    into this repo's Releases (tag "models"), so they can be downloaded from places that can only reach GitHub.
+# 2) Runs the official PyTorch implementations once on test audio and publishes the reference scores/features,
+#    so a PyTorch-free port of the same models can be checked number-for-number.
+on:
+  push:
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  weights:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download weights from Hugging Face
+        run: |
+          mkdir -p models
+          curl -L --fail --retry 3 -o models/audiobox-aesthetics_model.safetensors https://huggingface.co/facebook/audiobox-aesthetics/resolve/main/model.safetensors
+          curl -L --fail --retry 3 -o models/audiobox-aesthetics_config.json https://huggingface.co/facebook/audiobox-aesthetics/resolve/main/config.json
+          curl -L --fail --retry 3 -o models/muq-large-msd-iter_model.safetensors https://huggingface.co/OpenMuQ/MuQ-large-msd-iter/resolve/main/model.safetensors
+          curl -L --fail --retry 3 -o models/muq-large-msd-iter_config.json https://huggingface.co/OpenMuQ/MuQ-large-msd-iter/resolve/main/config.json
+          sha256sum models/* > models/SHA256SUMS.txt
+          ls -la models
+      - name: Publish as a release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          NOTES="Mirrored from huggingface.co/facebook/audiobox-aesthetics (CC-BY 4.0, Meta) and huggingface.co/OpenMuQ/MuQ-large-msd-iter (CC-BY-NC 4.0, Tencent AI Lab)."
+          gh release create models models/* --repo "$GITHUB_REPOSITORY" --title "models" --notes "$NOTES" \
+            || gh release upload models models/* --clobber --repo "$GITHUB_REPOSITORY"
+
+  reference-scores:
+    needs: weights
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install the official packages (CPU)
+        run: |
+          pip install --index-url https://download.pytorch.org/whl/cpu torch torchaudio
+          pip install audiobox_aesthetics muq librosa==0.11.0 hydra-core omegaconf safetensors einops easydict transformers soundfile
+          git clone --depth 1 https://github.com/ASLP-lab/SongEval
+      - name: Make test audio + run official Audiobox Aesthetics and SongEval
+        run: |
+          mkdir -p refs
+          cat > refs_run.py <<'PY'
+          import json, sys, os
+          import numpy as np, soundfile as sf, librosa, torch
+          torch.set_grad_enabled(False)
+          # deterministic synthetic music-like test signal (chords + kick/snare + noise), 12 s
+          def synth(sr):
+              rng = np.random.default_rng(1234)
+              t = np.arange(int(12 * sr)) / sr
+              y = np.zeros_like(t)
+              for k, f in enumerate([130.81, 155.56, 196.0, 261.63]):
+                  y += 0.12 * np.sin(2 * np.pi * f * t + k) * (1 + 0.3 * np.sin(2 * np.pi * 0.25 * t))
+              beat = 60 / 118
+              for b in np.arange(0, 12, beat):
+                  i = int(b * sr); n = int(0.25 * sr)
+                  tt = np.arange(n) / sr
+                  y[i:i + n] += 0.5 * np.sin(2 * np.pi * (50 + 80 * np.exp(-tt / 0.03)) * tt) * np.exp(-tt / 0.12)
+              for b in np.arange(beat, 12, 2 * beat):
+                  i = int(b * sr); n = int(0.18 * sr)
+                  y[i:i + n] += 0.2 * rng.standard_normal(n) * np.exp(-np.arange(n) / sr / 0.05)
+              y += 0.01 * rng.standard_normal(len(t))
+              return (y / np.abs(y).max() * 0.8).astype(np.float32)
+          for sr in (16000, 24000):
+              sf.write(f"refs/synth_{sr // 1000}k.wav", synth(sr), sr, subtype="FLOAT")
+              w, _ = librosa.load("SongEval/example/example.mp3", sr=sr)
+              sf.write(f"refs/example_{sr // 1000}k.wav", w, sr, subtype="FLOAT")
+          # --- official Meta Audiobox Aesthetics (loads facebook/audiobox-aesthetics from the Hub)
+          from audiobox_aesthetics.infer import initialize_predictor
+          pred = initialize_predictor()
+          aes = {}
+          for nm in ("synth", "example"):
+              aes[nm] = pred.forward([{"path": f"refs/{nm}_16k.wav"}])[0]
+          json.dump(aes, open("refs/audiobox_reference.json", "w"), indent=2)
+          print("audiobox", aes)
+          # --- official SongEval (MuQ layer-6 features + SongEval head)
+          sys.path.insert(0, "SongEval")
+          from muq import MuQ
+          from omegaconf import OmegaConf
+          from hydra.utils import instantiate
+          from safetensors.torch import load_file
+          cfg = OmegaConf.load("SongEval/config.yaml")
+          os.chdir("SongEval")
+          head = instantiate(cfg.generator).eval()
+          head.load_state_dict(load_file("ckpt/model.safetensors", device="cpu"), strict=False)
+          os.chdir("..")
+          muq = MuQ.from_pretrained("OpenMuQ/MuQ-large-msd-iter").eval()
+          se = {}
+          names = ["Coherence", "Musicality", "Memorability", "Clarity", "Naturalness"]
+          for nm in ("synth", "example"):
+              wav, _ = librosa.load(f"refs/{nm}_24k.wav", sr=24000)
+              out = muq(torch.tensor(wav).unsqueeze(0), output_hidden_states=True)
+              hs = out["hidden_states"]
+              np.save(f"refs/{nm}_muq_h6.npy", hs[6][0].float().numpy())
+              np.save(f"refs/{nm}_muq_h1.npy", hs[1][0].float().numpy())
+              s = head(hs[6]).squeeze(0)
+              se[nm] = {k: float(v) for k, v in zip(names, s)}
+          json.dump(se, open("refs/songeval_reference.json", "w"), indent=2)
+          print("songeval", se)
+          PY
+          python refs_run.py
+          ls -la refs
+      - name: Upload references to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload models refs/* --clobber --repo "$GITHUB_REPOSITORY"
