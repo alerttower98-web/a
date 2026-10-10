@@ -1,0 +1,21 @@
+name: fetch-demucs
+# Mirrors the official Demucs v4 6-stem model weights (htdemucs_6s; MIT, Meta) into release "daw".
+on:
+  push:
+    paths: [".github/workflows/fetch-demucs.yml"]
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  weights:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download and publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p dm
+          curl -L --fail --retry 3 -o dm/5c90dfd2-34c22ccb.th https://dl.fbaipublicfiles.com/demucs/hybrid_transformer/5c90dfd2-34c22ccb.th
+          sha256sum dm/* > dm/demucs_SHA256SUMS.txt; ls -la dm
+          gh release create daw --repo "$GITHUB_REPOSITORY" --title "daw" --notes "Headless DAW toolchain mirror" 2>/dev/null || true
+          gh release upload daw dm/* --clobber --repo "$GITHUB_REPOSITORY"
