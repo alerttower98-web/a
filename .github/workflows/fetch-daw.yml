@@ -1,0 +1,72 @@
+name: fetch-daw
+# Headless "DAW" toolchain for places that can only reach GitHub: plugin host + mastering wheels (Python 3.13),
+# plus a few free Linux audio plugins that are not hosted on GitHub. Published as release "daw".
+on:
+  push:
+    paths: [".github/workflows/fetch-daw.yml"]
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  daw:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Wheelhouse (pedalboard, matchering, mido)
+        run: |
+          set +e
+          mkdir -p out wh2
+          python -m pip install --upgrade pip wheel
+          pip wheel -w wh2 pedalboard matchering mido > out/wheel2_log.txt 2>&1
+          echo "rc=$?" >> out/wheel2_log.txt
+          ls -la wh2 | tee out/wheelhouse2_list.txt
+          tar cf wheelhouse2-cp313.tar wh2
+          sha256sum wheelhouse2-cp313.tar > wheelhouse2-cp313.sha256
+      - name: Free Linux plugins not hosted on GitHub
+        run: |
+          set +e
+          mkdir -p plug
+          for u in https://tal-software.com/downloads/plugins/TAL-NoiseMaker_64_linux.zip \
+                   https://tal-software.com/downloads/plugins/TAL-Reverb-4_64_linux.zip \
+                   https://tal-software.com/downloads/plugins/TAL-Chorus-LX_64_linux.zip; do
+            curl -L --fail --retry 2 -o "plug/$(basename $u)" "$u" >> out/plug_log.txt 2>&1 || echo "FAILED $u" >> out/plug_log.txt
+          done
+          ls -la plug | tee -a out/plug_log.txt
+      - name: Smoke test (load plugins headless with pedalboard)
+        run: |
+          set +e
+          pip install --no-index --find-links wh2 pedalboard matchering mido >> out/smoke_log.txt 2>&1
+          sudo apt-get install -y -qq libfreetype6 libfontconfig1 libx11-6 libxext6 libxrandr2 libxinerama1 libxcursor1 libasound2t64 >> out/smoke_log.txt 2>&1
+          curl -L --fail -o surge.tar.gz https://github.com/surge-synthesizer/releases-xt/releases/download/1.3.4/surge-xt-linux-x86_64-1.3.4.tar.gz >> out/smoke_log.txt 2>&1
+          mkdir -p surge && tar xzf surge.tar.gz -C surge && find surge -maxdepth 4 | head -50 >> out/smoke_log.txt
+          for z in plug/*.zip; do unzip -q -o "$z" -d "plug/$(basename $z .zip)"; done
+          find plug -name "*.vst3" -maxdepth 4 >> out/smoke_log.txt
+          cat > smoke.py <<'PY'
+          import glob, numpy as np, pedalboard, mido, sys
+          from pedalboard import load_plugin
+          from pedalboard.io import AudioFile
+          print("pedalboard", pedalboard.__version__)
+          for p in glob.glob("surge/**/Surge XT.vst3", recursive=True) + glob.glob("plug/**/*.vst3", recursive=True):
+              try:
+                  pl = load_plugin(p)
+                  print("LOADED", p, "instrument" if pl.is_instrument else "effect", len(pl.parameters), "params")
+                  if pl.is_instrument:
+                      msgs = [mido.Message("note_on", note=60, velocity=100, time=0), mido.Message("note_off", note=60, time=1.0)]
+                      y = pl(msgs, duration=2.0, sample_rate=44100)
+                      print("  rendered", y.shape, float(np.abs(y).max()))
+                      with AudioFile(f"out/test_{p.split('/')[-1].replace(' ', '_')}.wav", "w", 44100, y.shape[0]) as f:
+                          f.write(y)
+              except Exception as e:
+                  print("FAIL", p, repr(e))
+          PY
+          python smoke.py >> out/smoke_log.txt 2>&1
+          cat out/smoke_log.txt | tail -40
+      - name: Publish
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create daw --repo "$GITHUB_REPOSITORY" --title "daw" --notes "Headless DAW toolchain mirror" 2>/dev/null || true
+          gh release upload daw wheelhouse2-cp313.tar wheelhouse2-cp313.sha256 plug/*.zip out/* --clobber --repo "$GITHUB_REPOSITORY"
